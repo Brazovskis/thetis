@@ -177,3 +177,33 @@ make invert CASE=IndependentPointsScheme PARALLEL=4
 
 Note that if you try to use too many threads, the communication time between processes will dominate the runtime and 
 actually slow things down!
+
+## Running as ensemble
+
+EnsembleReducedFunctional can be leveraged to combine multiple inversions into a single optimisation problem. This is
+useful for cases where we have multiple sets of observations that do not coincide in time, but we want to use them all 
+to inform the same control field. 
+
+In this case, the forward model is run with the forcing offset by 800s in each subsequent ensemble with one station 
+being logged in each case. Observations are therefore taken across different time windows. 
+Each ensemble member in the inversion corresponds to a respective observation window from the forward run.
+
+To run the forward model for the ensemble, use:
+
+```sh
+mpiexec -n 14 python forward_run.py 
+```
+
+The number of cores must correspond to the number of ensemble members times the number of threads allocated to each 
+member (specified by parameter M in forward_run.py). 
+In this case 7 ensemble members are set up for seven stations, with each member splitting its mesh across 2 threads.
+
+Likewise, to run the inversion for the ensemble, use, e.g.:
+
+```sh
+mpiexec -n 14 python inverse_problem.py --case IndependentPointsScheme --no-taylor-test
+```
+
+For additional examples of Ensemble usage in firedrake, see
+https://www.firedrakeproject.org/ensemble_parallelism.html
+https://www.firedrakeproject.org/demos/full_waveform_inversion.py.html

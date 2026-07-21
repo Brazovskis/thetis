@@ -1,5 +1,6 @@
 import firedrake as fd
 from firedrake.adjoint import *
+from firedrake.petsc import PETSc
 import ufl
 from .configuration import FrozenHasTraits
 from .solver2d import FlowSolver2d
@@ -14,6 +15,7 @@ import h5py
 from scipy.interpolate import interp1d
 import time as time_mod
 from pyadjoint.optimization.optimization import SciPyConvergenceError
+from pyadjoint.reduced_functional_numpy import ReducedFunctionalNumPy
 import os
 from mpi4py import MPI
 
@@ -90,10 +92,10 @@ class ControlManager:
         # Initialize exporters if needed
         if not no_exports:
             fs = self.projection_space if not self.is_field else self.controls[0].function_space()
-            self.vtk_file = fd.VTKFile(f"{output_dir}/control_progress_{index:02d}.pvd")
+            self.vtk_file = fd.VTKFile(f"{output_dir}/control_progress_{index:02d}.pvd", comm=fs.mesh().comm)
             prefix = f"control_{index:02d}"
             self.hdf5_exporter = HDF5Exporter(fs, output_dir + "/hdf5", prefix)
-            self.gradient_vtk_file = fd.VTKFile(f"{output_dir}/gradient_progress_{index:02d}.pvd")
+            self.gradient_vtk_file = fd.VTKFile(f"{output_dir}/gradient_progress_{index:02d}.pvd", comm=fs.mesh().comm)
 
     def project_control(self, updated_controls):
         """Project masked combination or domain_constant to CG1 field for export."""
@@ -158,7 +160,7 @@ class InversionManager(FrozenHasTraits):
 
     @unfrozen
     def __init__(self, sta_manager, output_dir='outputs', no_exports=False, real=False,
-                 penalty_parameters=[], test_consistency=True, test_gradient=True):
+                 penalty_parameters=[], test_consistency=True, test_gradient=True, ensemble=None):
         """
         :arg sta_manager: the :class:`StationObservationManagerBase` instance
         :kwarg output_dir: model output directory
@@ -170,6 +172,7 @@ class InversionManager(FrozenHasTraits):
             which the :class:`ReducedFunctional` can recompute values
         :kwarg test_gradient: toggle testing the correctness with
             which the :class:`ReducedFunctional` can recompute gradients
+        :kwarg ensemble: an ensemble object
         """
         assert isinstance(sta_manager, StationObservationManagerBase)
         self.sta_manager = sta_manager
@@ -180,6 +183,7 @@ class InversionManager(FrozenHasTraits):
         self.penalty_parameters = penalty_parameters
         self.test_consistency = test_consistency
         self.test_gradient = test_gradient
+        self.ensemble = ensemble
         self._controls_wrapped = []
         self.control_managers = []
         self.initialized = False
@@ -187,6 +191,9 @@ class InversionManager(FrozenHasTraits):
         self.J = 0  # cost function value (float)
         self.J_reg = 0  # regularization term value (float)
         self.J_misfit = 0  # misfit term value (float)
+        self.J_local = 0  # local cost function value before ensemble reduction
+        self.J_reg_local = 0  # local regularization term value before ensemble reduction
+        self.J_misfit_local = 0  # local misfit term value before ensemble reduction
         self.dJdm_list = None  # cost function gradient (Function)
         self.m_list = None  # control (Function)
         self.Jhat = None
@@ -203,8 +210,9 @@ class InversionManager(FrozenHasTraits):
         if not self.no_exports:
             if self.real:
                 raise ValueError("Exports are not supported in Real mode.")
-            create_directory(self.output_dir)
-            create_directory(self.output_dir + '/hdf5')
+            comm = self.control_coeff_list[0].function_space().mesh().comm
+            create_directory(self.output_dir, comm=comm)
+            create_directory(self.output_dir + '/hdf5', comm=comm)
         self.initialized = True
 
     def add_control(self, controls, mappings=None):
@@ -279,6 +287,27 @@ class InversionManager(FrozenHasTraits):
         self.dJdm_list = djdm_list
         self.m_list = m_list
 
+    def _reduce_scalar(self, value):
+        """Reduce a scalar over the ensemble communicator if present."""
+        if self.ensemble is None:
+            return float(value)
+        return self.ensemble.ensemble_comm.allreduce(float(value), op=MPI.SUM)
+
+    def _set_reduced_objective(self, j_reduced):
+        """Store the reduced objective and reduced objective components."""
+        self.J = float(j_reduced)
+        self.J_reg = self._reduce_scalar(self.J_reg_local)
+        self.J_misfit = self._reduce_scalar(self.J_misfit_local)
+
+    def _update_objective_from_evaluation(self, j):
+        """Update objective bookkeeping consistently in serial and ensemble modes."""
+        if self.ensemble is None:
+            self.J = float(j)
+            self.J_reg = self.J_reg_local
+            self.J_misfit = self.J_misfit_local
+        else:
+            self._set_reduced_objective(j)
+
     def start_clock(self):
         self.tic = time_mod.perf_counter()
 
@@ -317,7 +346,7 @@ class InversionManager(FrozenHasTraits):
         self.J_misfit_progress.append(self.J_misfit)
         self.dJdm_progress.append(djdm)
         comm = self.dJdm_list[0].comm
-        if comm.rank == 0 and not self.no_exports:
+        if comm.rank == 0 and self.is_export_root:
             if self.real:
                 numpy.save(f'{self.output_dir}/m_progress', self.m_progress)
             numpy.save(f'{self.output_dir}/J_progress', self.J_progress)
@@ -332,7 +361,7 @@ class InversionManager(FrozenHasTraits):
                      f'J={self.J:.3e}, dJdm={djdm}, '
                      f'grad_ev={self.nb_grad_evals}, duration {elapsed}')
 
-        if not self.no_exports:
+        if self.is_export_root:
             ref_index = 0
             for cm in self.control_managers:
                 num_controls = len(cm.mappings) if cm.mappings is not None else 1
@@ -345,6 +374,33 @@ class InversionManager(FrozenHasTraits):
         self.i += 1
         self.reset_counters()
 
+    def _iter_control_subfunctions(self, functions=None):
+        """Yield each control together with whether it is real-valued or spatial."""
+        if functions is None:
+            functions = self.control_coeff_list
+        for func in functions:
+            if func.function_space().ufl_element().family() == "Real":
+                yield func, 'real'
+            else:
+                yield func, 'field'
+
+    def _set_controls_from_flat_array(self, values, functions=None):
+        """Assign controls from a flat local NumPy array."""
+        if functions is None:
+            functions = self.control_coeff_list
+        offset = 0
+        for func, kind in self._iter_control_subfunctions(functions):
+            if kind == 'real':
+                func.assign(float(values[offset]))
+                offset += 1
+            else:
+                with func.dat.vec as vec:
+                    nlocal = vec.getLocalSize()
+                    vec.array[:] = values[offset:offset + nlocal]
+                offset += nlocal
+        if offset != len(values):
+            raise ValueError(f"Control vector length mismatch: consumed {offset}, received {len(values)}")
+
     @property
     def rf_kwargs(self):
         """
@@ -354,20 +410,27 @@ class InversionManager(FrozenHasTraits):
 
         def functional_eval_cb(j, m):
             """Called after functional evaluation"""
-            self.J = float(j)
-            # collect additional data we want before it is discarded if we have garbage collection
             tape = get_working_tape()
             reg_blocks = tape.get_blocks(tag="reg_eval")
-            self.J_reg = sum([b.get_outputs()[0].saved_output for b in reg_blocks])
+            self.J_local = float(j)
+            self.J_reg_local = sum([b.get_outputs()[0].saved_output for b in reg_blocks])
             misfit_blocks = tape.get_blocks(tag="misfit_eval")
-            self.J_misfit = sum([b.get_outputs()[0].saved_output for b in misfit_blocks])
-            self.sta_manager.collect_time_series(self.i)
+            self.J_misfit_local = sum([b.get_outputs()[0].saved_output for b in misfit_blocks])
+            if not self.no_exports:
+                self.sta_manager.collect_time_series(self.i)
             return j
 
         def gradient_eval_cb(j, djdm, m):
             """Called after gradient evaluation"""
-            self.set_control_state(self.J, djdm, m)  # must be self.J as j is reset by garbage collection
+            self._set_reduced_objective(j)
+            self.set_control_state(float(self.J), djdm, m)
             self.nb_grad_evals += 1
+            djdm_printable = [fd.norm(f) for f in djdm]
+            if len(djdm) > 10:
+                djdm_msg = f"[{numpy.min(djdm_printable):.4e} .. {numpy.max(djdm_printable):.4e}]"
+            else:
+                djdm_msg = "[" + ", ".join([f"{dj:.4e}" for dj in djdm_printable]) + "]"
+            print_output(f"   Gradient evaluation {self.nb_grad_evals} complete. J={self.J}, dJdm={djdm_msg}")
             return djdm
 
         params = {
@@ -507,8 +570,28 @@ class InversionManager(FrozenHasTraits):
         Create a Pyadjoint :class:`ReducedFunctional` for the optimization.
         """
         if self.Jhat is None:
-            self.Jhat = ReducedFunctional(self.J, self.control_list, **self.rf_kwargs)
+            rf_cls = EnsembleReducedFunctional if self.ensemble is not None else ReducedFunctional
+            rf_args = [self.J, self.control_list]
+            if self.ensemble is not None:
+                rf_args.append(self.ensemble)
+            self.Jhat = rf_cls(*rf_args, **self.rf_kwargs)
         return self.Jhat
+
+    @property
+    def is_export_root(self):
+        """Return True on the rank responsible for shared optimization exports."""
+        if self.no_exports:
+            return False
+        if self.ensemble is None:
+            return True
+        return self.ensemble.ensemble_rank == 0
+
+    @property
+    def is_station_export_root(self):
+        """Return True on ranks that should write station time-series outputs."""
+        if self.no_exports:
+            return False
+        return True
 
     def stop_annotating(self):
         """
@@ -521,7 +604,10 @@ class InversionManager(FrozenHasTraits):
         if self.test_consistency:
             self.consistency_test()
         if self.test_gradient:
-            self.taylor_test()
+            if self.ensemble is not None:
+                warning("Skipping Taylor test for ensemble inversion: EnsembleReducedFunctional verification is not supported in this setup.")
+            else:
+                self.taylor_test()
         pause_annotation()
 
     def get_optimization_callback(self):
@@ -531,8 +617,13 @@ class InversionManager(FrozenHasTraits):
         """
 
         def optimization_callback(m):
+            if self.ensemble is not None:
+                self._set_controls_from_flat_array(numpy.asarray(m, dtype=PETSc.ScalarType))
+            J = self.reduced_functional(self.control_coeff_list)
+            if self.ensemble is not None:
+                self._set_reduced_objective(J)
             self.update_progress()
-            if not self.no_exports:
+            if self.is_station_export_root:
                 self.sta_manager.dump_time_series()
 
         return optimization_callback
@@ -548,14 +639,20 @@ class InversionManager(FrozenHasTraits):
         print_output(f'Running {opt_method} optimization')
         self.reset_counters()
         self.start_clock()
-        J = float(self.reduced_functional(self.control_coeff_list))
-        self.set_initial_state(J, self.reduced_functional.derivative(apply_riesz=True), self.control_coeff_list)
-        if not self.no_exports:
+        J = self.reduced_functional(self.control_coeff_list)
+        if self.ensemble is not None:
+            self._set_reduced_objective(J)
+        self.set_initial_state(self.J if self.ensemble is not None else float(J),
+                               self.reduced_functional.derivative(apply_riesz=True), self.control_coeff_list)
+        if self.is_export_root:
             self.sta_manager.collect_time_series(self.i)
             self.sta_manager.dump_time_series()
+        objective = self.reduced_functional
+        if self.ensemble is not None:
+            objective = ReducedFunctionalNumPy(self.reduced_functional)
         try:
             return minimize(
-                self.reduced_functional, method=opt_method, bounds=bounds,
+                objective, method=opt_method, bounds=bounds,
                 callback=self.get_optimization_callback(), options=opt_options)
         except SciPyConvergenceError as e:
             if "TOTAL NO. OF ITERATIONS REACHED LIMIT" in str(e):
@@ -572,6 +669,8 @@ class InversionManager(FrozenHasTraits):
         """
         print_output("Running consistency test")
         J = self.reduced_functional(self.control_coeff_list)
+        if self.ensemble is not None:
+            self._set_reduced_objective(J)
         if not numpy.isclose(J, self.J):
             raise ValueError(f"Consistency test failed (expected {self.J}, got {J})")
         print_output("Consistency test passed!")
@@ -928,8 +1027,8 @@ class StationObservationManager(StationObservationManagerBase):
         tape = get_working_tape()
 
         blocks = tape.get_blocks(tag=f'{self.variable} observation')
-        ts_data = [b.get_outputs()[0].saved_output.dat.data for b in blocks]  # .copy()?
-        ts_data = numpy.array(ts_data)  # shape (ntimesteps, nstations, ndims) ndims = 2 for vector
+        ts_data = [b.get_outputs()[0].saved_output.dat.data.copy() for b in blocks]
+        ts_data = numpy.array(ts_data, copy=True)
         if current_iteration == self.last_recorded_iteration:
             self.station_value_progress[-1] = ts_data
         else:
@@ -958,7 +1057,7 @@ class StationObservationManager(StationObservationManagerBase):
             "the functional post-evaluation callback)."
         )
 
-        create_directory(self.output_directory)
+        create_directory(self.output_directory, comm=self.mesh.comm)
 
         var = self.variable
 
