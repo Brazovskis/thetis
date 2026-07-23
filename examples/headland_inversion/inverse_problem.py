@@ -61,11 +61,11 @@ output_dir_invert = os.path.join(
 continue_annotation()
 
 tape = get_working_tape()
-# tape.enable_checkpointing(
-#     SingleMemoryStorageSchedule(),
-#     gc_timestep_frequency=28,  # every 28 time steps we will do garbage collection
-#     gc_generation=2
-# )
+tape.enable_checkpointing(
+    SingleMemoryStorageSchedule(),
+    gc_timestep_frequency=28,  # every 28 time steps we will do garbage collection
+    gc_generation=2
+)
 
 solver_obj, update_forcings = construct_solver(
     output_directory=output_dir_invert,

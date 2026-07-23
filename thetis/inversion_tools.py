@@ -293,20 +293,11 @@ class InversionManager(FrozenHasTraits):
             return float(value)
         return self.ensemble.ensemble_comm.allreduce(float(value), op=MPI.SUM)
 
-    def _set_reduced_objective(self, j_reduced):
-        """Store the reduced objective and reduced objective components."""
-        self.J = float(j_reduced)
-        self.J_reg = self._reduce_scalar(self.J_reg_local)
-        self.J_misfit = self._reduce_scalar(self.J_misfit_local)
-
     def _update_objective_from_evaluation(self, j):
         """Update objective bookkeeping consistently in serial and ensemble modes."""
-        if self.ensemble is None:
-            self.J = float(j)
-            self.J_reg = self.J_reg_local
-            self.J_misfit = self.J_misfit_local
-        else:
-            self._set_reduced_objective(j)
+        self.J_reg = self._reduce_scalar(self.J_reg_local)
+        self.J_misfit = self._reduce_scalar(self.J_misfit_local)
+        self.J = float(j) if j is not None else self.J_reg + self.J_misfit
 
     def start_clock(self):
         self.tic = time_mod.perf_counter()
@@ -416,13 +407,14 @@ class InversionManager(FrozenHasTraits):
             self.J_reg_local = sum([b.get_outputs()[0].saved_output for b in reg_blocks])
             misfit_blocks = tape.get_blocks(tag="misfit_eval")
             self.J_misfit_local = sum([b.get_outputs()[0].saved_output for b in misfit_blocks])
+            self._update_objective_from_evaluation(j)
             if not self.no_exports:
                 self.sta_manager.collect_time_series(self.i)
             return j
 
         def gradient_eval_cb(j, djdm, m):
             """Called after gradient evaluation"""
-            self._set_reduced_objective(j)
+            self._update_objective_from_evaluation(j)
             self.set_control_state(float(self.J), djdm, m)
             self.nb_grad_evals += 1
             djdm_printable = [fd.norm(f) for f in djdm]
@@ -620,8 +612,7 @@ class InversionManager(FrozenHasTraits):
             if self.ensemble is not None:
                 self._set_controls_from_flat_array(numpy.asarray(m, dtype=PETSc.ScalarType))
             J = self.reduced_functional(self.control_coeff_list)
-            if self.ensemble is not None:
-                self._set_reduced_objective(J)
+            self._update_objective_from_evaluation(J)
             self.update_progress()
             if self.is_station_export_root:
                 self.sta_manager.dump_time_series()
@@ -640,8 +631,7 @@ class InversionManager(FrozenHasTraits):
         self.reset_counters()
         self.start_clock()
         J = self.reduced_functional(self.control_coeff_list)
-        if self.ensemble is not None:
-            self._set_reduced_objective(J)
+        self._update_objective_from_evaluation(J)
         self.set_initial_state(self.J if self.ensemble is not None else float(J),
                                self.reduced_functional.derivative(apply_riesz=True), self.control_coeff_list)
         if self.is_export_root:
@@ -669,8 +659,7 @@ class InversionManager(FrozenHasTraits):
         """
         print_output("Running consistency test")
         J = self.reduced_functional(self.control_coeff_list)
-        if self.ensemble is not None:
-            self._set_reduced_objective(J)
+        self._update_objective_from_evaluation(J)
         if not numpy.isclose(J, self.J):
             raise ValueError(f"Consistency test failed (expected {self.J}, got {J})")
         print_output("Consistency test passed!")
